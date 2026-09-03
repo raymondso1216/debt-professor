@@ -24,7 +24,7 @@
   ::-webkit-scrollbar{width:8px;height:8px}
   ::-webkit-scrollbar-thumb{background:#D8D2C4;border-radius:4px}
   .badge{display:inline-flex;align-items:center;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;color:#fff;white-space:nowrap}
-  input,select,textarea{background:#fff}
+  input,select,textarea{background:#fff;box-sizing:border-box;width:100%}
   input:focus,select:focus,textarea:focus{outline:2px solid var(--gold);outline-offset:0px}
 </style>
 </head>
@@ -37,11 +37,11 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
   import {
-    getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut
+    getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut, createUserWithEmailAndPassword
   } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
   import {
     getFirestore, collection, doc, addDoc, setDoc, updateDoc, deleteDoc,
-    onSnapshot, query, orderBy, serverTimestamp, getDocs, getDoc
+    onSnapshot, query, orderBy, serverTimestamp, getDocs, getDoc, writeBatch
   } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
   // Firebase 專案設定 (debt-professor)
@@ -58,11 +58,16 @@
   const auth = getAuth(app);
   const db = getFirestore(app);
 
+  // Secondary app instance: lets admin create new login accounts
+  // without it hijacking/replacing the admin's own signed-in session.
+  const secondaryApp = initializeApp(firebaseConfig, "secondary");
+  const secondaryAuth = getAuth(secondaryApp);
+
   window.FB = {
-    auth, db,
-    signInWithEmailAndPassword, onAuthStateChanged, signOut,
+    auth, db, secondaryAuth,
+    signInWithEmailAndPassword, onAuthStateChanged, signOut, createUserWithEmailAndPassword,
     collection, doc, addDoc, setDoc, updateDoc, deleteDoc,
-    onSnapshot, query, orderBy, serverTimestamp, getDocs, getDoc
+    onSnapshot, query, orderBy, serverTimestamp, getDocs, getDoc, writeBatch
   };
   window.dispatchEvent(new Event('fbready'));
 </script>
@@ -147,6 +152,54 @@ function getNextCode(colleague, entries, excludeId) {
   return String(next).padStart(2, '0');
 }
 
+function parseTable(text) {
+  const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+  if (lines.length === 0) return { headers: [], rows: [] };
+  const delim = lines[0].includes('\t') ? '\t' : ',';
+  const headers = lines[0].split(delim).map(h => h.trim());
+  const rows = lines.slice(1).map(l => l.split(delim).map(c => c.trim()));
+  return { headers, rows };
+}
+
+function parseDateFlexible(str, assumedYear) {
+  if (!str) return '';
+  str = str.trim();
+  let m = str.match(/(\d{1,2})月(\d{1,2})日/);
+  if (m) return `${assumedYear}-${String(m[1]).padStart(2,'0')}-${String(m[2]).padStart(2,'0')}`;
+  m = str.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (m) return `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`;
+  const d = new Date(str);
+  if (!isNaN(d.getTime())) return ymd(d);
+  return '';
+}
+
+function guessFieldMap(headers) {
+  const find = (...keys) => headers.findIndex(h => keys.some(k => h.includes(k)));
+  return {
+    date: find('日期'),
+    name: find('姓名', '客戶'),
+    phone: find('電話'),
+    hkid: find('HKID', '身份證'),
+    debtContent: find('內容', '負債', '債務'),
+    status: find('狀態'),
+    referredColleague: find('轉介同事', '跟進同事', '同事'),
+    channel: find('來源', '邊個廣告', '渠道', 'wts', 'fb', 'ig'),
+    notes: find('備注', '備註', '最後'),
+  };
+}
+
+function guessStatusTarget(v) {
+  const s = (v || '').trim();
+  if (!s) return 1;
+  if (s.includes('白撞')) return 5;
+  if (s.includes('拒絕')) return 6;
+  if (s.includes('失聯')) return 4;
+  if (s.includes('轉介')) return 3;
+  if (s.includes('拎料') || s.includes('有興趣') || s.includes('提供')) return 2;
+  if (s.includes('未覆')) return 1;
+  return 1;
+}
+
 // ---------- Login ----------
 function Login({ onLoggedIn }) {
   const [username, setUsername] = useState('');
@@ -194,6 +247,20 @@ function StatusBadge({ status }) {
 }
 
 // ---------- Entry Form Modal ----------
+// Defined at module scope (not inside EntryModal) — redefining a component
+// inline on every render gives it a new identity, which makes React
+// unmount/remount its children (losing input focus / closing the keyboard
+// after every keystroke). Keeping it stable here fixes that.
+function Field({ label, children }) {
+  return (
+    <div className="mb-3">
+      <label className="block text-xs mb-1" style={{color:'var(--muted)'}}>{label}</label>
+      {children}
+    </div>
+  );
+}
+const inputCls = "w-full px-2 py-1.5 border border-[#D8D2C4] rounded text-sm box-border";
+
 function EntryModal({ initial, colleagues, entries, readOnly, onClose, onSave, onAddColleague }) {
   const [form, setForm] = useState(initial ? { ...emptyForm, ...initial } : { ...emptyForm });
   const [newColleague, setNewColleague] = useState('');
@@ -227,14 +294,6 @@ function EntryModal({ initial, colleagues, entries, readOnly, onClose, onSave, o
     onSave(form);
   };
 
-  const Field = ({ label, children }) => (
-    <div className="mb-3">
-      <label className="block text-xs mb-1" style={{color:'var(--muted)'}}>{label}</label>
-      {children}
-    </div>
-  );
-  const inputCls = "w-full px-2 py-1.5 border border-[#D8D2C4] rounded text-sm";
-
   return (
     <div style={{position:'fixed',inset:0,background:'rgba(22,36,63,0.4)',zIndex:50,display:'flex',alignItems:'flex-start',justifyContent:'center',overflowY:'auto',padding:'24px 12px'}}>
       <form onSubmit={submit} className="bg-white rounded-lg shadow-lg w-full" style={{maxWidth:640}}>
@@ -244,7 +303,7 @@ function EntryModal({ initial, colleagues, entries, readOnly, onClose, onSave, o
         </div>
         <fieldset disabled={readOnly} style={{border:'none',padding:0,margin:0}}>
         <div className="px-5 py-4" style={{maxHeight:'70vh',overflowY:'auto'}}>
-          <div className="grid grid-cols-2 gap-x-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4">
             <Field label="查詢日期">
               <input type="date" className={inputCls} value={form.date} onChange={e=>set('date', e.target.value)} />
             </Field>
@@ -271,7 +330,7 @@ function EntryModal({ initial, colleagues, entries, readOnly, onClose, onSave, o
             <textarea className={inputCls} rows={2} value={form.debtContent} onChange={e=>set('debtContent', e.target.value)} />
           </Field>
 
-          <div className="grid grid-cols-2 gap-x-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4">
             <Field label="TU Grade">
               <input className={inputCls} value={form.tuGrade} onChange={e=>set('tuGrade', e.target.value)} />
             </Field>
@@ -319,7 +378,7 @@ function EntryModal({ initial, colleagues, entries, readOnly, onClose, onSave, o
           </Field>
 
           {Number(form.status) === 3 && (
-            <div className="grid grid-cols-2 gap-x-4 p-3 rounded" style={{background:'#F6F4EF',border:'1px solid #EDE8DA'}}>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 p-3 rounded" style={{background:'#F6F4EF',border:'1px solid #EDE8DA'}}>
               <Field label="轉介同事">
                 {!showNewColleague ? (
                   <select className={inputCls} value={form.referredColleague} onChange={e=>handleColleagueChange(e.target.value)}>
@@ -599,6 +658,313 @@ function StatsPanel({ entries }) {
   );
 }
 
+// ---------- Accounts management (admin only) ----------
+function AccountsPanel({ db }) {
+  const [users, setUsers] = useState([]);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [name, setName] = useState('');
+  const [role, setRole] = useState('viewer');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  useEffect(() => {
+    const { collection, onSnapshot } = window.FB;
+    const unsub = onSnapshot(collection(db, 'users'), snap => {
+      setUsers(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    });
+    return unsub;
+  }, []);
+
+  const createAccount = async (e) => {
+    e.preventDefault();
+    setMsg('');
+    if (!username.trim() || !password.trim() || !name.trim()) {
+      setMsg('請填晒用戶名、密碼同姓名');
+      return;
+    }
+    if (password.length < 6) {
+      setMsg('密碼要至少6個字');
+      return;
+    }
+    setBusy(true);
+    try {
+      const { secondaryAuth, createUserWithEmailAndPassword, signOut, doc, setDoc } = window.FB;
+      const email = `${username.trim().toLowerCase()}@debt-professor.local`;
+      // Use the secondary auth instance so this doesn't sign the admin out
+      const cred = await createUserWithEmailAndPassword(secondaryAuth, email, password);
+      const uid = cred.user.uid;
+      await signOut(secondaryAuth);
+      await setDoc(doc(db, 'users', uid), { role, name: name.trim(), username: username.trim().toLowerCase() });
+      setMsg(`已建立帳戶：${username}（${role === 'viewer' ? '唯讀' : role === 'staff' ? '職員' : '管理員'}）`);
+      setUsername(''); setPassword(''); setName(''); setRole('viewer');
+    } catch (err) {
+      setMsg('建立失敗：' + (err.message || '未知錯誤'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const roleLabel = (r) => r === 'admin' ? '管理員' : r === 'staff' ? '職員' : '唯讀';
+
+  return (
+    <div>
+      <div className="bg-white rounded border border-[#EDE8DA] p-4 mb-6 max-w-md">
+        <div className="text-sm font-semibold mb-3" style={{color:'var(--navy)'}}>新增帳戶</div>
+        <form onSubmit={createAccount}>
+          <div className="mb-3">
+            <label className="block text-xs mb-1" style={{color:'var(--muted)'}}>用戶名（登入用，唔使打@後面）</label>
+            <input className="px-2 py-1.5 border border-[#D8D2C4] rounded text-sm" value={username} onChange={e=>setUsername(e.target.value)} />
+          </div>
+          <div className="mb-3">
+            <label className="block text-xs mb-1" style={{color:'var(--muted)'}}>密碼（至少6個字）</label>
+            <input type="password" className="px-2 py-1.5 border border-[#D8D2C4] rounded text-sm" value={password} onChange={e=>setPassword(e.target.value)} />
+          </div>
+          <div className="mb-3">
+            <label className="block text-xs mb-1" style={{color:'var(--muted)'}}>顯示姓名</label>
+            <input className="px-2 py-1.5 border border-[#D8D2C4] rounded text-sm" value={name} onChange={e=>setName(e.target.value)} />
+          </div>
+          <div className="mb-3">
+            <label className="block text-xs mb-1" style={{color:'var(--muted)'}}>角色</label>
+            <select className="px-2 py-1.5 border border-[#D8D2C4] rounded text-sm" value={role} onChange={e=>setRole(e.target.value)}>
+              <option value="viewer">唯讀</option>
+              <option value="staff">職員</option>
+              <option value="admin">管理員</option>
+            </select>
+          </div>
+          {msg && <div className="text-xs mb-3" style={{color: msg.startsWith('已建立') ? 'var(--ok)' : 'var(--alert)'}}>{msg}</div>}
+          <button disabled={busy} type="submit" style={{background:'var(--navy)'}} className="text-white text-sm px-4 py-2 rounded disabled:opacity-50">
+            {busy ? '建立緊…' : '建立帳戶'}
+          </button>
+        </form>
+      </div>
+
+      <div className="bg-white rounded border border-[#EDE8DA] overflow-hidden max-w-md">
+        <div className="px-4 py-2 text-sm font-semibold" style={{color:'var(--navy)',borderBottom:'1px solid #EDE8DA'}}>現有帳戶</div>
+        <table className="w-full">
+          <tbody>
+            {users.map(u => (
+              <tr key={u.id} style={{borderBottom:'1px solid #F2EEE2'}}>
+                <td className="px-4 py-2 text-sm">{u.name || '-'}</td>
+                <td className="px-4 py-2 text-xs" style={{color:'var(--muted)'}}>{u.username ? `${u.username}@debt-professor.local` : u.id}</td>
+                <td className="px-4 py-2 text-xs"><span className="badge" style={{background:'var(--slate)'}}>{roleLabel(u.role)}</span></td>
+              </tr>
+            ))}
+            {users.length === 0 && <tr><td className="px-4 py-3 text-sm text-[var(--muted)]">未有帳戶紀錄</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Import from pasted spreadsheet data ----------
+const APP_FIELDS = [
+  { key: 'date', label: '查詢日期', required: true },
+  { key: 'name', label: '客戶姓名', required: true },
+  { key: 'phone', label: '電話號碼' },
+  { key: 'hkid', label: 'HKID' },
+  { key: 'debtContent', label: '債務內容' },
+  { key: 'status', label: '狀態' },
+  { key: 'referredColleague', label: '轉介同事' },
+  { key: 'channel', label: '來源/渠道' },
+  { key: 'notes', label: '備注' },
+];
+
+function ImportPanel({ entries, colleagues, db, onAddColleague }) {
+  const [rawText, setRawText] = useState('');
+  const [parsed, setParsed] = useState(null);
+  const [fieldMap, setFieldMap] = useState({});
+  const [statusMap, setStatusMap] = useState({});
+  const [assumedYear, setAssumedYear] = useState(new Date().getFullYear());
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState('');
+
+  const doParse = () => {
+    const p = parseTable(rawText);
+    if (p.headers.length === 0) { alert('冇解析到任何資料，check吓有冇貼咗嘢'); return; }
+    setParsed(p);
+    setFieldMap(guessFieldMap(p.headers));
+    setResult('');
+  };
+
+  const statusValues = useMemo(() => {
+    if (!parsed || fieldMap.status === undefined || fieldMap.status < 0) return [];
+    const set = new Set(parsed.rows.map(r => (r[fieldMap.status] || '').trim()).filter(Boolean));
+    return [...set];
+  }, [parsed, fieldMap.status]);
+
+  useEffect(() => {
+    if (statusValues.length) {
+      const m = {};
+      statusValues.forEach(v => { m[v] = guessStatusTarget(v); });
+      setStatusMap(m);
+    }
+  }, [statusValues.join('|')]);
+
+  const buildRow = (r) => {
+    const get = (key) => (fieldMap[key] >= 0 ? (r[fieldMap[key]] || '').trim() : '');
+    const statusRaw = get('status');
+    const status = statusRaw ? (statusMap[statusRaw] ?? guessStatusTarget(statusRaw)) : 1;
+    const colleague = get('referredColleague');
+    return {
+      date: parseDateFlexible(get('date'), assumedYear) || ymd(new Date()),
+      name: get('name'),
+      phone: get('phone'),
+      hkid: get('hkid'),
+      debtContent: get('debtContent'),
+      channel: get('channel') || '其他',
+      status: colleague ? 3 : status,
+      referredColleague: colleague || '',
+      notes: get('notes'),
+      threadsId: '', tuGrade: '', line1Count: '', line1Total: '', line2Count: '', line2Total: '',
+      hasDefaulted: '冇', hasLitigation: '冇', monthlyIncome: '', paymentMethod: 'ATP', hasMPF: '有',
+      code: '',
+    };
+  };
+
+  const previewRows = parsed ? parsed.rows.filter(r => (fieldMap.name >= 0 && r[fieldMap.name])).map(buildRow) : [];
+
+  const runImport = async () => {
+    if (!previewRows.length) return;
+    setBusy(true);
+    setResult('');
+    try {
+      const { writeBatch, doc, collection, serverTimestamp, setDoc } = window.FB;
+      // ensure colleague docs exist
+      const neededColleagues = [...new Set(previewRows.map(r => r.referredColleague).filter(Boolean))];
+      for (const c of neededColleagues) {
+        if (!colleagues.includes(c)) await onAddColleague(c);
+      }
+      // running per-colleague code counters, continuing from existing max
+      const counters = {};
+      const codeFor = (colleague) => {
+        if (!colleague) return '';
+        if (counters[colleague] === undefined) {
+          const used = entries.filter(e => e.referredColleague === colleague && e.code)
+            .map(e => parseInt(e.code, 10)).filter(n => !isNaN(n));
+          counters[colleague] = used.length ? Math.max(...used) : 0;
+        }
+        counters[colleague] += 1;
+        return String(counters[colleague]).padStart(2, '0');
+      };
+
+      let count = 0;
+      const chunkSize = 400;
+      for (let i = 0; i < previewRows.length; i += chunkSize) {
+        const chunk = previewRows.slice(i, i + chunkSize);
+        const batch = writeBatch(db);
+        chunk.forEach(row => {
+          const ref = doc(collection(db, 'inquiries'));
+          const payload = { ...row };
+          if (payload.status === 3) payload.code = codeFor(payload.referredColleague);
+          payload.createdAt = serverTimestamp();
+          payload.updatedAt = serverTimestamp();
+          payload.statusUpdatedAt = serverTimestamp();
+          batch.set(ref, payload);
+          count++;
+        });
+        await batch.commit();
+      }
+      setResult(`匯入完成，共 ${count} 筆`);
+      setRawText(''); setParsed(null);
+    } catch (err) {
+      setResult('匯入失敗：' + (err.message || '未知錯誤'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div>
+      <div className="bg-white rounded border border-[#EDE8DA] p-4 mb-4">
+        <div className="text-sm font-semibold mb-2" style={{color:'var(--navy)'}}>1. 貼上資料</div>
+        <div className="text-xs mb-2" style={{color:'var(--muted)'}}>
+          喺 Google Sheets 揀晒你要匯入嘅範圍（連標題row）→ 複製 → 貼落呢度
+        </div>
+        <textarea rows={6} className="px-2 py-1.5 border border-[#D8D2C4] rounded text-xs font-mono"
+          value={rawText} onChange={e=>setRawText(e.target.value)} placeholder="貼上你複製嘅表格內容…" />
+        <div className="flex items-center gap-3 mt-2">
+          <button onClick={doParse} style={{background:'var(--navy)'}} className="text-white text-sm px-4 py-2 rounded">解析</button>
+          <div className="text-xs" style={{color:'var(--muted)'}}>
+            日期無年份時假設係： 
+            <input type="number" className="inline-block w-20 px-1 py-0.5 border border-[#D8D2C4] rounded ml-1" value={assumedYear} onChange={e=>setAssumedYear(Number(e.target.value))} />
+          </div>
+        </div>
+      </div>
+
+      {parsed && (
+        <>
+          <div className="bg-white rounded border border-[#EDE8DA] p-4 mb-4">
+            <div className="text-sm font-semibold mb-3" style={{color:'var(--navy)'}}>2. 對應欄位</div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4">
+              {APP_FIELDS.map(f => (
+                <div key={f.key} className="mb-2">
+                  <label className="block text-xs mb-1" style={{color:'var(--muted)'}}>{f.label}{f.required ? ' *' : ''}</label>
+                  <select className="px-2 py-1.5 border border-[#D8D2C4] rounded text-sm"
+                    value={fieldMap[f.key] ?? -1}
+                    onChange={e=>setFieldMap(m=>({...m, [f.key]: Number(e.target.value)}))}>
+                    <option value={-1}>（不匯入）</option>
+                    {parsed.headers.map((h, idx) => <option key={idx} value={idx}>{h || `欄位${idx+1}`}</option>)}
+                  </select>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {statusValues.length > 0 && (
+            <div className="bg-white rounded border border-[#EDE8DA] p-4 mb-4">
+              <div className="text-sm font-semibold mb-3" style={{color:'var(--navy)'}}>3. 對應狀態</div>
+              {statusValues.map(v => (
+                <div key={v} className="flex items-center gap-3 mb-2">
+                  <span className="text-sm w-28">{v}</span>
+                  <span style={{color:'var(--muted)'}}>→</span>
+                  <select className="px-2 py-1 border border-[#D8D2C4] rounded text-sm"
+                    value={statusMap[v] ?? guessStatusTarget(v)}
+                    onChange={e=>setStatusMap(m=>({...m, [v]: Number(e.target.value)}))}>
+                    {STATUS.map(s => <option key={s.v} value={s.v}>{s.v}. {s.label}</option>)}
+                  </select>
+                </div>
+              ))}
+              <div className="text-xs mt-1" style={{color:'var(--muted)'}}>* 如果「轉介同事」欄有值，無論狀態揀咩都會自動當「已經轉介咗同事」</div>
+            </div>
+          )}
+
+          <div className="bg-white rounded border border-[#EDE8DA] p-4 mb-4 overflow-x-auto">
+            <div className="text-sm font-semibold mb-3" style={{color:'var(--navy)'}}>4. 預覽（共 {previewRows.length} 筆，顯示頭5筆）</div>
+            <table className="w-full">
+              <thead>
+                <tr className="text-left text-xs" style={{color:'var(--muted)'}}>
+                  <th className="px-2 py-1">日期</th><th className="px-2 py-1">姓名</th><th className="px-2 py-1">電話</th>
+                  <th className="px-2 py-1">狀態</th><th className="px-2 py-1">轉介同事</th>
+                </tr>
+              </thead>
+              <tbody>
+                {previewRows.slice(0,5).map((r, i) => (
+                  <tr key={i} style={{borderTop:'1px solid #F2EEE2'}}>
+                    <td className="px-2 py-1 text-sm">{r.date}</td>
+                    <td className="px-2 py-1 text-sm">{r.name}</td>
+                    <td className="px-2 py-1 text-sm">{r.phone}</td>
+                    <td className="px-2 py-1"><StatusBadge status={r.status} /></td>
+                    <td className="px-2 py-1 text-sm">{r.referredColleague || '-'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {result && <div className="text-sm mb-3" style={{color: result.startsWith('匯入完成') ? 'var(--ok)' : 'var(--alert)'}}>{result}</div>}
+
+          <button disabled={busy || !previewRows.length} onClick={runImport}
+            style={{background:'var(--gold)'}} className="text-white text-sm px-5 py-2 rounded font-medium disabled:opacity-50">
+            {busy ? '匯入緊…' : `開始匯入（${previewRows.length}筆）`}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ---------- Main App ----------
 function MainApp({ user, role, displayName }) {
   const isViewer = role === 'viewer';
@@ -701,6 +1067,8 @@ function MainApp({ user, role, displayName }) {
           <TabBtn id="all" label="全部查詢" />
           <TabBtn id="referred" label="已轉介列表" />
           <TabBtn id="stats" label="統計報表" />
+          {!isViewer && <TabBtn id="import" label="資料匯入" />}
+          {isAdmin && <TabBtn id="accounts" label="帳戶管理" />}
         </div>
         {!isViewer && (
           <button onClick={openNew} style={{background:'var(--gold)'}} className="mb-2 text-white text-sm px-4 py-2 rounded font-medium">
@@ -714,6 +1082,8 @@ function MainApp({ user, role, displayName }) {
         {tab === 'all' && <AllEntries entries={entries} onOpen={openEdit} onDelete={remove} canDelete={isAdmin} />}
         {tab === 'referred' && <ReferredList entries={entries} onUpdateCode={updateCode} onUpdateSubStatus={updateSubStatus} onOpen={openEdit} readOnly={isViewer} />}
         {tab === 'stats' && <StatsPanel entries={entries} />}
+        {tab === 'import' && !isViewer && <ImportPanel entries={entries} colleagues={colleagues} db={window.FB.db} onAddColleague={addColleague} />}
+        {tab === 'accounts' && isAdmin && <AccountsPanel db={window.FB.db} />}
       </div>
 
       {showModal && (
